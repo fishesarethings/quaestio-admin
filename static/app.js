@@ -26,7 +26,15 @@ async function api(path, opts = {}) {
     credentials: "same-origin",
     ...opts,
   });
-  if (res.status === 401) { show("login-view"); throw new Error("Please sign in."); }
+  if (res.status === 401) {
+    sessionStorage.removeItem(TOKEN_KEY);
+    me = null;
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+    show("login-view");
+    renderUser();
+    throw new Error("Please sign in.");
+  }
   const data = await res.json().catch(() => null);
   if (!res.ok) {
     const msg = data && data.error ? data.error : `Request failed (${res.status})`;
@@ -56,7 +64,8 @@ function handleLogout(e) {
   e.preventDefault();
   const t = getToken();
   sessionStorage.removeItem(TOKEN_KEY);
-  if (t) fetch(`/auth/logout?token=${encodeURIComponent(t)}`).catch(() => {});
+  me = null;
+  if (t) fetch("/api/auth/logout", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` } }).catch(() => {});
   location.href = "/";
 }
 
@@ -499,7 +508,7 @@ function renderPresetTiles(kind, bundle, selected) {
   const list = bundle && bundle.length ? bundle : [];
   grid.innerHTML = list
     .map(
-      (b) => `<div class="preset-tile${b.key === selected ? " active" : ""}${b.custom ? " custom" : ""}" data-kind="${kind}" data-key="${ESCAPED(b.key)}">
+      (b) => `<div class="preset-tile${b.key === selected ? " active" : ""}${b.custom ? " custom" : ""}" data-kind="${kind}" data-key="${ESCAPED(b.key)}" role="button" tabindex="0" aria-pressed="${b.key === selected}">
         <div class="preset-tile-top">
           <span class="preset-tile-emoji">${ESCAPED(b.emoji || "✨")}</span>
           <span class="preset-tile-name">${ESCAPED(b.title)}</span>
@@ -850,7 +859,7 @@ function readSettings() {
   return {
     ai_enabled: b("#ai_enabled"),
     ai_source: $("#ai_source").value,
-    ai_endpoint: endpointLocked ? "" : $("#ai_endpoint").value.trim(),
+    ...(endpointLocked ? {} : {ai_endpoint: $("#ai_endpoint").value.trim()}),
     ai_model: $("#ai_model").value,
     ai_memory: $("#ai_memory").value,
     ai_quota: $("#ai_quota").value,
@@ -1033,6 +1042,11 @@ function fmtBytes(n) {
 }
 
 /* ---------- events ---------- */
+function on(sel, ev, fn) {
+  const el = $(sel);
+  if (el) el.addEventListener(ev, fn);
+  return el;
+}
 function wireEvents() {
   const navToggle = $("#nav-toggle");
   if (navToggle) navToggle.addEventListener("click", () => {
@@ -1147,6 +1161,14 @@ function wireEvents() {
     }
   });
 
+  sv.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const tile = e.target.closest(".preset-tile");
+    if (tile) {
+      e.preventDefault();
+      selectPreset(tile.dataset.kind, tile.dataset.key);
+    }
+  });
   /* Custom preset add / save */
   ["personality", "character"].forEach((kind) => {
     const addBtn = $(`[data-preset-add="${kind}"]`);
@@ -1218,7 +1240,7 @@ function wireEvents() {
     }
   });
 
-  $("#clear-memory").addEventListener("click", async () => {
+  on("#clear-memory", "click", async () => {
     await saving($("#clear-memory"), async () => {
       try {
         await api(`/api/guilds/${activeGuild.id}/memory/clear`, { method: "POST", body: "{}" });
@@ -1230,7 +1252,7 @@ function wireEvents() {
     });
   });
 
-  $("#reset-instructions").addEventListener("click", async () => {
+  on("#reset-instructions", "click", async () => {
     if (!confirm("Reset the system prompt back to default (clears it)? Your current instructions will be removed.")) return;
     $("#ai_instructions").value = "";
     markDirty();
@@ -1242,7 +1264,9 @@ function wireEvents() {
     });
   });
 
-  $("#save-ai").addEventListener("click", async () => {
+  on("#save-ai", "click", async () => {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
     await saving($("#save-ai"), async () => {
       try {
         await saveSettings(activeGuild.id, readSettings(), $("#save-status-ai"));
@@ -1250,26 +1274,26 @@ function wireEvents() {
       } catch { /* toast already shown */ }
     });
   });
-  $("#save-welcome").addEventListener("click", async () => {
+  on("#save-welcome", "click", async () => {
     await saving($("#save-welcome"), async () => {
       try { await saveSettings(activeGuild.id, readSettings(), $("#save-status-welcome")); }
       catch { /* toast already shown */ }
     });
   });
-  $("#save-levels").addEventListener("click", async () => {
+  on("#save-levels", "click", async () => {
     await saving($("#save-levels"), async () => {
       try { await saveSettings(activeGuild.id, readSettings(), $("#save-status-levels")); }
       catch { /* toast already shown */ }
     });
   });
-  $("#save-moderation").addEventListener("click", async () => {
+  on("#save-moderation", "click", async () => {
     await saving($("#save-moderation"), async () => {
       try { await saveSettings(activeGuild.id, readSettings(), $("#save-status-moderation")); }
       catch { /* toast already shown */ }
     });
   });
 
-  $("#save-host").addEventListener("click", async () => {
+  on("#save-host", "click", async () => {
     await saving($("#save-host"), async () => {
       try {
         const mode = ($("#host-mode-seg .seg-btn.active") || {}).dataset?.mode || "managed";

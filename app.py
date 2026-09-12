@@ -15,7 +15,10 @@ Env:
 
 import datetime
 import hashlib
+import hmac
+import asyncio
 import json
+import re
 import os
 import secrets
 import shutil
@@ -85,8 +88,20 @@ async def api_health():
     return out
 
 # Login sessions keyed by a random bearer token (no cookies — Safari-safe OAuth).
-# In-memory: a dashboard restart signs everyone out, which is fine for a panel.
+# In-memory with TTL: entries expire after 7 days and the table is capped, so
+# stale admin rights and unbounded growth are both impossible.
 SESSIONS = {}
+SESSION_TTL = 7 * 24 * 3600
+SESSION_MAX = 2000
+
+
+def _session_sweep():
+    now = time.time()
+    dead = [t for t, (_, at) in SESSIONS.items() if now - at > SESSION_TTL]
+    for t in dead:
+        SESSIONS.pop(t, None)
+    while len(SESSIONS) > SESSION_MAX:
+        SESSIONS.pop(next(iter(SESSIONS)), None)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +131,26 @@ def db_init():
         );
         CREATE TABLE IF NOT EXISTS warned (
             guild_id TEXT, user_id TEXT, reason TEXT, at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS xp (
+            guild_id TEXT, user_id TEXT, messages INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS usage (
+            guild_id TEXT, bucket TEXT, calls INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, bucket)
+        );
+        CREATE TABLE IF NOT EXISTS memory (
+            guild_id TEXT, channel_id TEXT, role TEXT, text TEXT, at TEXT,
+            user_id TEXT DEFAULT '', name TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS birthdays (
+            guild_id TEXT, user_id TEXT, month TEXT, day TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS tags (
+            guild_id TEXT, name TEXT, content TEXT, author TEXT, at TEXT,
+            PRIMARY KEY (guild_id, name)
         );
         CREATE TABLE IF NOT EXISTS hosters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,6 +228,7 @@ def _migrate_pool_broker(conn):
     for ddl in (
         "CREATE INDEX IF NOT EXISTS idx_jobs_status ON pool_jobs(status, model, id)",
         "CREATE INDEX IF NOT EXISTS idx_hosters_pull ON hosters(pull, enabled)",
+        "CREATE INDEX IF NOT EXISTS idx_hosters_secret ON hosters(node_secret_hash)",
     ):
         try:
             conn.execute(ddl)
@@ -239,6 +275,7 @@ def get_cfg(guild_id, key, default=None):
 
 def get_all_cfg(guild_id, keys, defaults=None):
     """Batch-fetch config keys in one SQLite round-trip (fixes N+1 on settings load)."""
+    defaults = defaults or {}
     defaults = defaults or {}
     conn = db()
     rows = conn.execute(
@@ -298,18 +335,24 @@ async def exchange_code(code: str) -> dict:
 def session_user(request: Request) -> dict:
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        data = SESSIONS.get(auth[7:].strip())
-        if data:
-            return data
+        entry = SESSIONS.get(auth[7:].strip())
+        if entry:
+            data, at = entry
+            if time.time() - at < SESSION_TTL:
+                return data
+            SESSIONS.pop(auth[7:].strip(), None)
     raise HTTPException(401, "Not signed in")
 
 
+def _perm_ok(g):
+    try:
+        return bool(g.get("owner")) or bool(int(g.get("permissions", 0)) & ADMIN_BITS)
+    except (ValueError, TypeError):
+        return bool(g.get("owner"))
+
+
 def admin_guilds(user: dict) -> list:
-    return [
-        g
-        for g in user.get("guilds", [])
-        if g.get("owner") or (int(g.get("permissions", 0)) & ADMIN_BITS)
-    ]
+    return [g for g in user.get("guilds", []) if _perm_ok(g)]
 
 
 def require_admin_guild(request: Request, guild_id: int) -> dict:
@@ -319,7 +362,7 @@ def require_admin_guild(request: Request, guild_id: int) -> dict:
         (x for x in data.get("guilds", []) if str(x.get("id")) == str(guild_id)),
         None,
     )
-    if not g or not (g.get("owner") or int(g.get("permissions", 0)) & ADMIN_BITS):
+    if not g or not _perm_ok(g):
         raise HTTPException(403, "Admin of this server required")
     return data
 
@@ -403,22 +446,36 @@ async def auth_login():
 
 
 @app.get("/auth/callback")
-async def auth_callback(request: Request, code: str):
+async def auth_callback(request: Request, code: str = "", error: str = ""):
+    if error or not code:
+        return RedirectResponse("/?error=login")
     try:
         data = await exchange_code(code)
     except HTTPException:
         return RedirectResponse("/?error=login")
+    user = data.get("user") or {}
+    if not user.get("id") or not isinstance(data.get("guilds"), list):
+        return RedirectResponse("/?error=login")
     if not data.get("guilds"):
         return RedirectResponse("/?error=needadmin")
     token = secrets.token_urlsafe(32)
-    SESSIONS[token] = data
+    SESSIONS[token] = (data, time.time())
+    _session_sweep()
     return RedirectResponse(f"/#token={token}")
 
 
 @app.get("/auth/logout")
 async def auth_logout(request: Request, token: str = ""):
+    if not token:
+        token = _bearer_token(request)
     SESSIONS.pop(token, None)
     return RedirectResponse("/")
+
+
+@app.post("/api/auth/logout")
+async def api_logout(request: Request):
+    SESSIONS.pop(_bearer_token(request), None)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -428,14 +485,16 @@ async def auth_logout(request: Request, token: str = ""):
 @app.get("/api/me")
 async def api_me(request: Request):
     data = session_user(request)
-    user = data["user"]
+    user = data.get("user") or {}
+    if not user.get("id"):
+        raise HTTPException(401, "Not signed in")
     admins = await host_admin_ids()
     is_host_admin = str(user.get("id")) in admins
     bots = await bot_guild_ids()
     guilds = []
     for g in data.get("guilds", []):
         gid = str(g.get("id"))
-        can_manage = bool(g.get("owner")) or bool(int(g.get("permissions", 0)) & ADMIN_BITS)
+        can_manage = _perm_ok(g)
         present = gid in bots
         guilds.append({
             "id": gid,
@@ -512,6 +571,9 @@ async def guild_refs(guild_id: str) -> dict:
                 pass
     REF_CACHE[guild_id] = out
     REF_CACHE_AT[guild_id] = now
+    while len(REF_CACHE) > 500:
+        REF_CACHE.pop(next(iter(REF_CACHE)))
+        REF_CACHE_AT.pop(next(iter(REF_CACHE_AT)), None)
     # Bound the caches so a flood of guild IDs can't grow them forever.
     if len(REF_CACHE) > 500:
         oldest = sorted(REF_CACHE_AT, key=lambda k: REF_CACHE_AT[k])[:100]
@@ -624,6 +686,53 @@ def effective_ai_limits(guild_id, _pre=None):
             "source": source, "endpoint": endpoint,
             "host_memory": host_mem, "host_quota": host_quota,
             "contributor_perks": perks}
+
+
+# Per-key validation for settings writes (type, range, length). Unknown keys
+# never reach the DB (callers already filter by SETTING_KEYS/HOST_KEYS).
+_INT_RANGES = {
+    "ai_memory": (1, 20), "ai_max_tokens": (20, 1000), "ai_window": (1, 168),
+    "ai_quota": (0, 10000), "ai_conv_minutes": (1, 60), "warnlimit": (1, 20),
+    "host_memory": (1, 20), "host_quota": (0, 10000), "xp_min_words": (0, 50),
+    "xp_max_words": (1, 500), "xp_cooldown": (0, 3600),
+}
+_FLOAT_RANGES = {"ai_temperature": (0.0, 2.0)}
+_TEXT_MAX = {
+    "ai_instructions": 2000, "welcome_message": 2000, "ai_endpoint": 200,
+    "ai_model": 80, "ai_personality": 80, "ai_character": 80,
+    "ai_channels": 2000, "welcome_channel": 40, "welcome_role": 40,
+    "levelrole": 40, "birthday_channel": 40, "host_mode": 20, "host_model": 80,
+}
+
+
+def _validate_setting(key, value):
+    if key in _INT_RANGES:
+        lo, hi = _INT_RANGES[key]
+        try:
+            v = int(str(value).strip())
+        except (ValueError, TypeError):
+            raise HTTPException(400, f"{key} must be a number")
+        if not (lo <= v <= hi):
+            raise HTTPException(400, f"{key} must be {lo}-{hi}")
+        return str(v)
+    if key in _FLOAT_RANGES:
+        lo, hi = _FLOAT_RANGES[key]
+        try:
+            v = float(str(value).strip())
+        except (ValueError, TypeError):
+            raise HTTPException(400, f"{key} must be a number")
+        if not (lo <= v <= hi):
+            raise HTTPException(400, f"{key} must be {lo}-{hi}")
+        return str(v)
+    if key in _TEXT_MAX:
+        v = str(value)
+        if len(v) > _TEXT_MAX[key]:
+            raise HTTPException(400, f"{key} is too long (max {_TEXT_MAX[key]})")
+        return v
+    v = str(value)
+    if len(v) > 2000:
+        raise HTTPException(400, f"{key} is too long")
+    return v
 
 
 @app.get("/api/guilds/{guild_id}/settings")
@@ -783,19 +892,30 @@ async def api_host_pool(request: Request):
 async def api_host_pool_add(request: Request):
     await require_host_admin(request)
     import secrets as _secrets
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     endpoint = (body.get("endpoint") or "").strip()
-    if not endpoint:
-        raise HTTPException(400, "Endpoint is required")
-    model = (body.get("model") or "").strip() or "default"
-    share = max(0, min(100, int(body.get("share", 50) or 50)))
-    name = (body.get("name") or "").strip()[:80] or "node-" + _secrets.token_hex(2)
+    if not endpoint or len(endpoint) > 200 or not _endpoint_public_ok(endpoint):
+        raise HTTPException(400, "Endpoint must be a reachable http(s) URL (no localhost/metadata)")
+    model = (body.get("model") or "").strip()[:80] or "default"
+    try:
+        share = max(0, min(100, int(body.get("share", 50) or 50)))
+    except (ValueError, TypeError):
+        share = 50
+    name = (body.get("name") or "").strip()
+    if name and not re.match(r"^node-[0-9a-f]{1,16}$", name):
+        raise HTTPException(400, "Name must look like node-xxxx (anonymous IDs only)")
+    name = name[:80] or "node-" + _secrets.token_hex(2)
+    import hashlib as _hl
+    ehash = _hl.sha256(endpoint.strip().rstrip("/").lower().encode()).hexdigest()
     conn = db()
     conn.execute(
-        "INSERT INTO hosters (name, endpoint, model, share, enabled, added_by, at) VALUES (?, ?, ?, ?, 1, 'dash', ?)",
+        "INSERT INTO hosters (name, endpoint, model, share, enabled, added_by, at, endpoint_hash) VALUES (?, ?, ?, ?, 1, 'dash', ?, ?)",
         (name, qconfig.maybe_encrypt("pool_endpoint", endpoint),
          qconfig.maybe_encrypt("pool_model", model), share,
-         datetime.datetime.now(datetime.timezone.utc).isoformat()),
+         datetime.datetime.now(datetime.timezone.utc).isoformat(), ehash),
     )
     conn.commit()
     conn.close()
@@ -805,12 +925,20 @@ async def api_host_pool_add(request: Request):
 @app.post("/api/host/pool/{hoster_id}")
 async def api_host_pool_update(request: Request, hoster_id: int):
     await require_host_admin(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     conn = db()
     if "enabled" in body:
         conn.execute("UPDATE hosters SET enabled=? WHERE id=?", (1 if body.get("enabled") else 0, hoster_id))
     if "share" in body and "share_delta" not in body:
-        conn.execute("UPDATE hosters SET share=? WHERE id=?", (max(0, min(100, int(body.get("share", 0) or 0))), hoster_id))
+        try:
+            share = max(0, min(100, int(body.get("share", 0) or 0)))
+        except (ValueError, TypeError):
+            conn.close()
+            raise HTTPException(400, "share must be 0-100")
+        conn.execute("UPDATE hosters SET share=? WHERE id=?", (share, hoster_id))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -836,11 +964,40 @@ async def api_host_pool_delete(request: Request, hoster_id: int):
 POOL_JOIN_KEY = os.environ.get("POOL_JOIN_KEY", "").strip()
 
 
+def _safe_eq(a: str, b: str) -> bool:
+    try:
+        return hmac.compare_digest(a or "", b or "")
+    except Exception:
+        return False
+
+
 def _bearer_token(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return ""
+
+
+def _endpoint_public_ok(endpoint: str) -> bool:
+    """Push endpoints must be reachable URLs but never loopback, link-local,
+    or cloud metadata addresses (SSRF). LAN/Tailnet ranges stay allowed so
+    home boxes keep working."""
+    try:
+        import ipaddress
+        u = urllib.parse.urlparse(endpoint)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return False
+        try:
+            ip = ipaddress.ip_address(u.hostname)
+        except ValueError:
+            return True  # DNS names resolve at call time; broker never fetches on register
+        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return False
+        if ip.is_private and str(ip) == "169.254.169.254":
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _node_secret_hash(secret: str) -> str:
@@ -883,7 +1040,7 @@ async def api_pool_register(request: Request):
     if not _broker_ok(request):
         raise HTTPException(429, "Too many requests — slow down.")
     key = (request.headers.get("x-pool-key") or "").strip()
-    has_key = bool(POOL_JOIN_KEY) and key == POOL_JOIN_KEY
+    has_key = bool(POOL_JOIN_KEY) and _safe_eq(key, POOL_JOIN_KEY)
     try:
         body = await request.json()
     except Exception:
@@ -897,8 +1054,8 @@ async def api_pool_register(request: Request):
     # push nodes must supply one.
     if not endpoint and not pull:
         raise HTTPException(400, "endpoint is required (or register as a pull worker)")
-    if endpoint and (len(endpoint) > 200 or not endpoint.startswith(("http://", "https://"))):
-        raise HTTPException(400, "endpoint must be an http(s) URL")
+    if endpoint and (len(endpoint) > 200 or not _endpoint_public_ok(endpoint)):
+        raise HTTPException(400, "endpoint must be a reachable http(s) URL (no localhost/metadata)")
     model = (body.get("model") or "").strip()[:80] or "default"
     try:
         share = max(1, min(100, int(body.get("share", 50) or 50)))
@@ -946,12 +1103,22 @@ async def api_pool_register(request: Request):
 @app.post("/api/pool/unregister")
 async def api_pool_unregister(request: Request):
     """Node leaves the pool. Its row is removed; re-registering starts fresh."""
-    body = await request.json()
+    if not _broker_ok(request):
+        raise HTTPException(429, "Too many requests — slow down.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     secret = (body.get("node_secret") or "").strip()
     if not secret:
         raise HTTPException(400, "node_secret is required")
     conn = db()
-    conn.execute("DELETE FROM hosters WHERE node_secret_hash=?", (_node_secret_hash(secret),))
+    row = conn.execute("SELECT id FROM hosters WHERE node_secret_hash=?",
+                       (_node_secret_hash(secret),)).fetchone()
+    if row:
+        conn.execute("UPDATE pool_jobs SET status='pending', claimed_by=0 WHERE claimed_by=? AND status='claimed'",
+                     (row["id"],))
+        conn.execute("DELETE FROM hosters WHERE id=?", (row["id"],))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -993,7 +1160,8 @@ async def api_pool_rename(request: Request):
         except HTTPException:
             raise
         except Exception:
-            pass
+            conn.close()
+            raise HTTPException(400, "Rename check failed — try again.")
     new_name = "node-" + secrets.token_hex(4)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     conn.execute("UPDATE hosters SET name=?, renamed_at=? WHERE id=?", (new_name, now, row["id"]))
@@ -1007,7 +1175,7 @@ async def api_pool_nodes(request: Request, limit: int = 100, offset: int = 0):
     """Candidates for the shared bot. Bot-token only: endpoints/models are
     decrypted here in memory and never stored or echoed elsewhere.
     Paginated so a 100k pool doesn't dump the whole table in one response."""
-    if not BOT_TOKEN or _bearer_token(request) != BOT_TOKEN:
+    if not BOT_TOKEN or not _safe_eq(_bearer_token(request), BOT_TOKEN):
         raise HTTPException(401, "Bot token required")
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
@@ -1035,10 +1203,15 @@ async def api_pool_nodes(request: Request, limit: int = 100, offset: int = 0):
 
 @app.post("/api/pool/me")
 async def api_pool_me(request: Request):
+    if not _broker_ok(request):
+        raise HTTPException(429, "Too many requests — slow down.")
     """A node's own contribution stats, guarded by its node secret. This is
     what `quaestio contribute` / pool status shows so contributors can see
     what they've shared and how many requests their box served."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     secret = (body.get("node_secret") or "").strip()
     if not secret:
         raise HTTPException(400, "node_secret is required")
@@ -1070,9 +1243,14 @@ async def api_pool_me(request: Request):
 @app.post("/api/pool/report")
 async def api_pool_report(request: Request):
     """Bot health report for a node (mirrors the local pool_record logic)."""
-    if not BOT_TOKEN or _bearer_token(request) != BOT_TOKEN:
+    if not _broker_ok(request):
+        raise HTTPException(429, "Too many requests — slow down.")
+    if not BOT_TOKEN or not _safe_eq(_bearer_token(request), BOT_TOKEN):
         raise HTTPException(401, "Bot token required")
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     ok = bool(body.get("ok"))
     match = (body.get("name") or "").strip()
     conn = db()
@@ -1120,7 +1298,7 @@ async def api_jobs_claim(request: Request):
     models = [str(m) for m in (body.get("models") or []) if str(m).strip()][:20]
     conn = db()
     node = conn.execute(
-        "SELECT id, model, enabled FROM hosters WHERE node_secret_hash=?",
+        "SELECT id, model, enabled, failed, down_until FROM hosters WHERE node_secret_hash=?",
         (_node_secret_hash(secret),),
     ).fetchone()
     if not node:
@@ -1129,6 +1307,9 @@ async def api_jobs_claim(request: Request):
     if not (node["enabled"] or 0):
         conn.close()
         return {"job": None, "status": "pending"}
+    if (node["down_until"] or "") > datetime.datetime.now(datetime.timezone.utc).isoformat():
+        conn.close()
+        return {"job": None, "status": "parked"}
     now = datetime.datetime.now(datetime.timezone.utc)
     stale = (now - datetime.timedelta(seconds=JOB_CLAIM_TIMEOUT)).isoformat()
     want = models or ([node["model"]] if node["model"] else [])
@@ -1139,13 +1320,13 @@ async def api_jobs_claim(request: Request):
         job = conn.execute(
             f"""SELECT id, prompt, system, model, temperature, max_tokens, top_p, repeat_penalty, stop
                 FROM pool_jobs WHERE status IN ('pending','claimed') AND model IN ({q})
-                AND (status='pending' OR claimed_at<?) ORDER BY id LIMIT 1""",
+                AND tries<8 AND (status='pending' OR claimed_at<?) ORDER BY id LIMIT 1""",
             [*want, stale],
         ).fetchone()
     else:
         job = conn.execute(
             """SELECT id, prompt, system, model, temperature, max_tokens, top_p, repeat_penalty, stop
-               FROM pool_jobs WHERE status='pending' OR (status='claimed' AND claimed_at<?)
+               FROM pool_jobs WHERE tries<8 AND (status='pending' OR (status='claimed' AND claimed_at<?))
                ORDER BY id LIMIT 1""",
             (stale,),
         ).fetchone()
@@ -1154,8 +1335,16 @@ async def api_jobs_claim(request: Request):
         conn.commit()
         conn.close()
         return {"job": None}
-    conn.execute("UPDATE pool_jobs SET status='claimed', claimed_at=?, claimed_by=?, tries=tries+1 WHERE id=?",
-                 (now.isoformat(), node["id"], job["id"]))
+    # Atomic claim: only one worker wins even under races.
+    cur = conn.execute(
+        """UPDATE pool_jobs SET status='claimed', claimed_at=?, claimed_by=?, tries=tries+1
+           WHERE id=? AND (status='pending' OR (status='claimed' AND claimed_at<?))""",
+        (now.isoformat(), node["id"], job["id"], stale),
+    )
+    if cur.rowcount != 1:
+        conn.commit()
+        conn.close()
+        return {"job": None, "status": "contended"}
     conn.execute("UPDATE hosters SET last_seen=? WHERE id=?", (now.isoformat(), node["id"]))
     conn.commit()
     conn.close()
@@ -1196,7 +1385,7 @@ async def api_jobs_complete(request: Request):
     response = (body.get("response") or "")[:4000]
     error = (body.get("error") or "")[:500]
     if error:
-        conn.execute("UPDATE pool_jobs SET status='failed', error=?, done_at=? WHERE id=? AND claimed_by=?",
+        conn.execute("UPDATE pool_jobs SET status='failed', error=?, done_at=? WHERE id=? AND claimed_by=? AND status='claimed'",
                      (error, now, job_id, node["id"]))
         # Reputation: consecutive worker failures park the node, same as push
         # hosts — spam/garbage nodes remove themselves without human review.
@@ -1207,7 +1396,7 @@ async def api_jobs_complete(request: Request):
                      + datetime.timedelta(seconds=600)).isoformat()
             conn.execute("UPDATE hosters SET down_until=? WHERE id=?", (until, node["id"]))
     else:
-        conn.execute("UPDATE pool_jobs SET status='done', result=?, done_at=? WHERE id=? AND claimed_by=?",
+        conn.execute("UPDATE pool_jobs SET status='done', result=?, done_at=? WHERE id=? AND claimed_by=? AND status='claimed'",
                      (response, now, job_id, node["id"]))
         conn.execute("UPDATE hosters SET served=served+1, last_ok=?, failed=0, down_until='' WHERE id=?",
                      (now, node["id"]))
@@ -1220,10 +1409,15 @@ async def api_jobs_complete(request: Request):
 @app.post("/api/guilds/{guild_id}/settings")
 async def api_set_settings(request: Request, guild_id: int):
     require_admin_guild(request, guild_id)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     for key, value in body.items():
         if key in SETTING_KEYS and value is not None:
-            set_cfg(guild_id, key, value)
+            if key == "ai_endpoint" and not str(value).strip():
+                continue  # locked/shared-mode clients send ""; never wipe it
+            set_cfg(guild_id, key, _validate_setting(key, value))
     return {"ok": True}
 
 
@@ -1352,7 +1546,10 @@ async def api_save_preset(request: Request, guild_id: int, kind: str):
     require_admin_guild(request, guild_id)
     if kind not in ("personality", "character"):
         raise HTTPException(400, "kind must be personality or character")
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     name = str(body.get("name", "")).strip()
     text = str(body.get("text", "")).strip()
     emoji = str(body.get("emoji", "")).strip()
@@ -1382,7 +1579,10 @@ async def api_delete_preset(request: Request, guild_id: int, kind: str):
     require_admin_guild(request, guild_id)
     if kind not in ("personality", "character"):
         raise HTTPException(400, "kind must be personality or character")
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     name = str(body.get("name", "")).strip()
     if not name or name in PRESET_BUILTINS[kind]:
         raise HTTPException(400, "Built-in presets can't be deleted")
@@ -1419,41 +1619,48 @@ async def api_get_host(request: Request):
 @app.post("/api/host/settings")
 async def api_set_host(request: Request):
     await require_host_admin(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
     for key, value in body.items():
         if key in HOST_KEYS and value is not None:
-            set_cfg(HOST_ID, key, value)
+            set_cfg(HOST_ID, key, _validate_setting(key, value))
     return {"ok": True}
 
 
 @app.get("/api/host/stats")
 async def api_host_stats(request: Request):
     await require_host_admin(request)
-    stats = {"ollama": False, "models": []}
-    try:
-        with urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=6) as resp:
-            data = json.loads(resp.read().decode())
-        stats["ollama"] = True
-        stats["models"] = [m["name"] for m in data.get("models", []) if m.get("name")]
-    except Exception:
-        pass
-    try:
-        with open("/proc/meminfo") as f:
-            meminfo = dict(line.split(":", 1) for line in f)
-        stats["mem_total"] = int(meminfo["MemTotal"].split()[0]) * 1024
-        stats["mem_avail"] = int(meminfo["MemAvailable"].split()[0]) * 1024
-        stats["mem_pct"] = round(100 * (1 - stats["mem_avail"] / stats["mem_total"]))
-        with open("/proc/loadavg") as f:
-            stats["cpu_pct"] = round(float(f.read().split()[0]) * 100 / os.cpu_count())
-    except Exception:
-        pass
-    try:
-        total, _, _ = shutil.disk_usage("/")
-        stats["disk_total"] = total
-    except Exception:
-        pass
-    stats["model_count"] = len(stats["models"])
-    return stats
+
+    def _collect():
+        stats = {"ollama": False, "models": []}
+        try:
+            with urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+            stats["ollama"] = True
+            stats["models"] = [m["name"] for m in data.get("models", []) if m.get("name")]
+        except Exception:
+            pass
+        try:
+            with open("/proc/meminfo") as f:
+                meminfo = dict(line.split(":", 1) for line in f)
+            stats["mem_total"] = int(meminfo["MemTotal"].split()[0]) * 1024
+            stats["mem_avail"] = int(meminfo["MemAvailable"].split()[0]) * 1024
+            stats["mem_pct"] = round(100 * (1 - stats["mem_avail"] / stats["mem_total"]))
+            with open("/proc/loadavg") as f:
+                stats["cpu_pct"] = round(float(f.read().split()[0]) * 100 / (os.cpu_count() or 1))
+        except Exception:
+            pass
+        try:
+            total, _, _ = shutil.disk_usage("/")
+            stats["disk_total"] = total
+        except Exception:
+            pass
+        stats["model_count"] = len(stats["models"])
+        return stats
+
+    return await asyncio.to_thread(_collect)
 
 
 # ---------------------------------------------------------------------------
@@ -1549,6 +1756,9 @@ a{color:inherit}
         <select id="web-model" style="display:block;margin-top:4px;background:#0b1120;color:var(--text);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:6px">
           <option value="Qwen2.5-1.5B-Instruct-q4f32_1-MLC">Qwen 1.5B (~1 GB, recommended)</option>
           <option value="Qwen2.5-0.5B-Instruct-q4f32_1-MLC">Qwen 0.5B (~400 MB, light)</option>
+          <option value="Qwen2.5-3B-Instruct-q4f32_1-MLC">Qwen 3B (~2 GB)</option>
+          <option value="Llama-3.2-3B-Instruct-q4f32_1-MLC">Llama 3.2 3B (~2 GB)</option>
+          <option value="TinyLlama-1.1B-Chat-v1.0-q4f32_1-MLC">TinyLlama (~700 MB, fastest)</option>
         </select></label>
       <label style="font-size:.85rem">Share
         <select id="web-share" style="display:block;margin-top:4px;background:#0b1120;color:var(--text);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:6px">
@@ -1577,6 +1787,9 @@ let engine = null, serving = false, served = 0, nodeSecret = localStorage.getIte
 const MODEL_MAP = {
   "Qwen2.5-1.5B-Instruct-q4f32_1-MLC": "qwen2.5:1.5b",
   "Qwen2.5-0.5B-Instruct-q4f32_1-MLC": "qwen2.5:0.5b",
+  "Qwen2.5-3B-Instruct-q4f32_1-MLC": "qwen2.5:3b",
+  "Llama-3.2-3B-Instruct-q4f32_1-MLC": "llama3.2:3b",
+  "TinyLlama-1.1B-Chat-v1.0-q4f32_1-MLC": "tinyllama:latest",
 };
 const brokerModel = () => MODEL_MAP[$("web-model").value] || "qwen2.5:1.5b";
 async function api(path, body) {
@@ -1720,9 +1933,10 @@ async function refreshStats() {
       box.innerHTML = '<p style="color:var(--muted)">No served requests yet — run <code>quaestio pool-serve</code> and take the crown.</p>';
       return;
     }
+    const esc = (t) => String(t ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
     box.innerHTML = d.leaders.map((l,i)=>{
       const isMine = mine && l.name === mine;
-      return `<div class="leader"${isMine ? ' style="border:1px solid #6366f1;border-radius:8px;padding-left:8px"' : ""}><span>${medals[i] || "▸"} ${l.name}${isMine ? " (you)" : ""}</span><span class="served">${l.served} served · ${l.share}%</span></div>`;
+      return `<div class="leader"${isMine ? ' style="border:1px solid #6366f1;border-radius:8px;padding-left:8px"' : ""}><span>${medals[i] || "▸"} ${esc(l.name)}${isMine ? " (you)" : ""}</span><span class="served">${Number(l.served) || 0} served · ${Number(l.share) || 0}%</span></div>`;
     }).join("");
   } catch {}
 }
