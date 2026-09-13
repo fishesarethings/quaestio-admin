@@ -488,7 +488,19 @@
         <div class="field-group">
           <label for="welcome_message">Message</label>
           <textarea id="welcome_message" rows="3" placeholder="Welcome {member}! 🎉"></textarea>
-          <p class="hint">Use <code>{member}</code> for the new member's name, <code>{guild}</code> for the server name.</p>
+          <p class="hint">Use <code>{member}</code>, <code>{server}</code>, <code>{count}</code>, <code>{icon}</code>, <code>{avatar}</code>. Add a banner URL below for a rich embed.</p>
+        </div>
+
+        <div class="field-group">
+          <label for="welcome_banner">Banner image URL <span class="muted-2">(optional)</span></label>
+          <input type="url" id="welcome_banner" class="mono" placeholder="https://…/banner.png" autocomplete="off">
+          <p class="hint">Shows as a big embed image with their avatar thumbnail. Leave empty for plain text.</p>
+        </div>
+
+        <div class="field-group">
+          <label for="goodbye_message">Goodbye message <span class="muted-2">(optional)</span></label>
+          <textarea id="goodbye_message" rows="2" placeholder="Bye {member}, we'll miss you!"></textarea>
+          <p class="hint">Posted when someone leaves. Empty = no goodbye message.</p>
         </div>
 
         <div class="preview">

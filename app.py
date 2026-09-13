@@ -619,7 +619,8 @@ SETTING_KEYS = [
     "ai_quota", "ai_channels", "ai_mention", "ai_temperature", "ai_max_tokens",
     "ai_source", "ai_contribute", "ai_window", "ai_personality", "ai_character",
     "ai_conv", "ai_conv_minutes",
-    "welcome_enabled", "welcome_channel", "welcome_message",
+    "welcome_enabled", "welcome_channel", "welcome_message", "welcome_banner",
+    "goodbye_message",
     "welcome_role", "levelrole", "level_announce", "xp_enabled", "warnlimit",
     "xp_spam", "xp_min_words", "xp_max_words", "xp_cooldown",
     "birthday_enabled", "birthday_channel",
@@ -710,7 +711,8 @@ _FLOAT_RANGES = {"ai_temperature": (0.0, 2.0)}
 _TEXT_MAX = {
     "ai_instructions": 2000, "welcome_message": 2000, "ai_endpoint": 200,
     "ai_model": 80, "ai_personality": 80, "ai_character": 80,
-    "ai_channels": 2000, "welcome_channel": 40, "welcome_role": 40,
+    "ai_channels": 2000, "welcome_channel": 40, "welcome_role": 40, "welcome_banner": 500,
+    "goodbye_message": 2000,
     "levelrole": 40, "birthday_channel": 40, "host_mode": 20, "host_model": 80,
 }
 

@@ -243,6 +243,8 @@ async function loadSettings(id) {
   set("#ai_instructions", s.ai_instructions);
   set("#ai_max_tokens", s.ai_max_tokens);
   set("#welcome_message", s.welcome_message);
+  set("#welcome_banner", s.welcome_banner);
+  set("#goodbye_message", s.goodbye_message);
   set("#warnlimit", s.warnlimit);
   set("#xp_min_words", s.xp_min_words);
   set("#xp_max_words", s.xp_max_words);
@@ -877,6 +879,8 @@ function readSettings() {
     welcome_enabled: b("#welcome_enabled"),
     welcome_channel: refValue("welcome_channel"),
     welcome_message: $("#welcome_message").value,
+    welcome_banner: $("#welcome_banner").value.trim(),
+    goodbye_message: $("#goodbye_message").value,
     welcome_role: refValue("welcome_role"),
     levelrole: refValue("levelrole"),
     xp_enabled: b("#xp_enabled"),
