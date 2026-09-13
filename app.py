@@ -787,6 +787,19 @@ def _validate_setting(key, value):
     return v
 
 
+def _cfg_version(guild_id) -> int:
+    try:
+        return int(get_cfg(guild_id, "_cfg_v", "0") or 0)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _bump_cfg_version(guild_id) -> int:
+    v = _cfg_version(guild_id) + 1
+    set_cfg(guild_id, "_cfg_v", str(v))
+    return v
+
+
 @app.get("/api/guilds/{guild_id}/settings")
 async def api_get_settings(request: Request, guild_id: int):
     require_admin_guild(request, guild_id)
@@ -1493,12 +1506,17 @@ async def api_set_settings(request: Request, guild_id: int):
         body = await request.json()
     except Exception:
         raise HTTPException(400, "Invalid JSON")
+    touched_ai = False
     for key, value in body.items():
         if key in SETTING_KEYS and value is not None:
             if key == "ai_endpoint" and not str(value).strip():
                 continue  # locked/shared-mode clients send ""; never wipe it
             set_cfg(guild_id, key, _validate_setting(key, value))
-    return {"ok": True}
+            if key.startswith("ai_"):
+                touched_ai = True
+    if touched_ai:
+        _bump_cfg_version(guild_id)
+    return {"ok": True, "cfg_version": _cfg_version(guild_id)}
 
 
 # ---------------------------------------------------------------------------
@@ -1709,6 +1727,7 @@ async def api_set_host(request: Request):
     for key, value in body.items():
         if key in HOST_KEYS and value is not None:
             set_cfg(HOST_ID, key, _validate_setting(key, value))
+        _bump_cfg_version(guild_id)
     return {"ok": True}
 
 
@@ -1773,7 +1792,7 @@ async def api_site_stats():
         conn.close()
     return {"servers": servers, "messages": int(msgs), "cmds": int(cmds),
             "nodes": int(nodes),
-            "commands": 41, "paywalls": 0, "private": 100}
+            "commands": 51, "paywalls": 0, "private": 100}
 
 
 @app.get("/api/pool/public")
@@ -1804,6 +1823,36 @@ async def api_pool_leaderboard(limit: int = 10):
     conn.close()
     return {"leaders": [{"name": r["name"], "served": r["served"] or 0,
                          "share": r["share"] or 0} for r in rows]}
+
+
+@app.get("/api/pool/active")
+async def api_pool_active(limit: int = 25):
+    """Currently-active pool nodes that respond and listen. Anonymous IDs only.
+
+    pull=1 rows with fresh last_seen are listening (claim heartbeats);
+    any enabled row past cooldown with recent last_ok is responding.
+    """
+    import datetime as _dt
+    limit = max(1, min(limit, 50))
+    conn = db()
+    try:
+        now = _dt.datetime.now(_dt.timezone.utc)
+        cutoff = (now - _dt.timedelta(seconds=180)).isoformat()
+        now_s = now.isoformat()
+        rows = conn.execute(
+            """SELECT name, pull, share, last_seen, last_ok, served
+               FROM hosters WHERE enabled=1
+               AND (last_seen>? OR last_ok>?)
+               AND (down_until='' OR down_until IS NULL OR down_until<=?)
+               ORDER BY pull DESC, last_seen DESC, last_ok DESC LIMIT ?""",
+            (cutoff, cutoff, now_s, limit),
+        ).fetchall()
+        return {"active": [{"name": r["name"], "listening": bool(r["pull"]),
+                            "share": r["share"] or 0,
+                            "last_seen": r["last_seen"] or "",
+                            "served": r["served"] or 0} for r in rows]}
+    finally:
+        conn.close()
 
 
 POOL_PAGE = """<!DOCTYPE html>
@@ -1848,16 +1897,17 @@ a{color:inherit}
 <body>
 <div class="wrap">
   <a class="brand" href="https://quaestio.online"><img src="https://quaestio.online/assets/logo-512.png" alt="Quaestio"><strong>Quaestio</strong>&nbsp;pool</a>
-  <span style="float:right"><a href="https://github.com/fishesarethings/quaestio-admin" target="_blank" rel="noopener" title="Pool source on GitHub" aria-label="Pool source on GitHub" style="color:var(--muted);opacity:.7"><svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg></a></span>
+  <span style="float:right"><a href="https://github.com/fishesarethings/quaestio-admin-panel" target="_blank" rel="noopener" title="Pool source on GitHub" aria-label="Pool source on GitHub" style="color:var(--muted);opacity:.7"><svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg></a></span>
   <h1>Lend spare AI compute.<br><span class="grad">Earn real perks.</span></h1>
   <p class="lead">Your box answers AI requests for Quaestio servers whenever it's online — and goes quiet on its own when it's not. Anonymous by design: random node IDs only, endpoints encrypted.</p>
   <div class="stats">
-    <div class="stat"><div class="num" id="st-nodes">…</div><div class="lbl">nodes online</div></div>
+    <div class="stat"><div class="num" id="st-nodes">…</div><div class="lbl">registered nodes</div></div>
+    <div class="stat"><div class="num" id="st-active">…</div><div class="lbl">active now</div></div>
     <div class="stat"><div class="num" id="st-share">…</div><div class="lbl">capacity shared</div></div>
     <div class="stat"><div class="num" id="st-served">…</div><div class="lbl">requests served</div></div>
   </div>
   <div class="card"><h3>① Install</h3><pre><code id="cmd-install">curl -fsSL https://quaestio.online/bot/install.sh | bash</code><button class="copybtn" data-copy="cmd-install">⧉ Copy</button></pre></div>
-  <p style="color:var(--muted);font-size:.82rem">Review source first: <a href="https://github.com/fishesarethings/quaestio-site/blob/main/bot/install.sh">install.sh</a> · uninstall anytime with <code>quaestio uninstall</code>.</p>
+  <p style="color:var(--muted);font-size:.82rem">Review source first: <a href="https://github.com/fishesarethings/quaestio-website/blob/main/bot/install.sh">install.sh</a> · uninstall anytime with <code>quaestio uninstall</code>.</p>
   <div class="card"><h3>② Serve</h3><pre><code id="cmd-serve">quaestio pool-serve</code><button class="copybtn" data-copy="cmd-serve">⧉ Copy</button></pre><p style="color:var(--muted);margin-top:8px">Registers you (or reuses your node) and works jobs until Ctrl-C. Behind any NAT — no port forwards, no extra accounts.</p></div>
   <div class="card"><h3>🌐 Or host right in this browser</h3>
     <p style="color:var(--muted)">No install at all — the AI model runs on this page with WebGPU. Keep the tab open and it serves pool jobs like any other node.</p>
@@ -1886,9 +1936,10 @@ a{color:inherit}
     <p style="color:var(--muted);font-size:.82rem;margin-top:10px">⚠️ Warnings: uses your GPU/CPU while serving (fan + battery); keep this tab open and your machine awake — closing it just idles you, nothing breaks; first start downloads the model once (~1 GB, cached after); needs a WebGPU browser (Chrome/Edge 113+, Safari 26+).</p>
   </div>
   <div class="card"><h3>③ Perks</h3><ul><li>Priority routing — your box serves you first</li><li>2–4x request limits by share (more compute = more headroom)</li><li>🌟 contributor badge in <code>/ai status</code> + leaderboard glory below</li><li>Not mining: no crypto, no cash, no payouts — just a faster bot for everyone</li></ul></div>
+  <div class="card"><h3>🟢 Active pool nodes</h3><p style="color:var(--muted)">Nodes responding and listening right now — anonymous IDs only, live.</p><div id="active-nodes"><p style="color:var(--muted)">Loading…</p></div></div>
   <div class="card"><h3>🏆 Top contributors</h3><p style="color:var(--muted)">Anonymous node IDs only — ranked by requests served.</p><div id="leaders"><p style="color:var(--muted)">Loading…</p></div></div>
   <p class="links">Run a Discord server? <a href="https://admin.quaestio.online">Open the admin panel</a> · <a href="https://quaestio.online">quaestio.online</a></p>
-  <footer style="margin-top:18px;text-align:center;color:var(--muted);font-size:.82rem"><a href="https://github.com/fishesarethings/quaestio-pool" target="_blank" rel="noopener" title="Pool source on GitHub" aria-label="Pool source on GitHub" style="text-decoration:none"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg></a> · <a href="https://quaestio.online/terms.html">Terms</a> · <a href="https://quaestio.online/privacy.html">Privacy</a></footer>
+  <footer style="margin-top:18px;text-align:center;color:var(--muted);font-size:.82rem"><a href="https://github.com/fishesarethings/quaestio-pool-nodes" target="_blank" rel="noopener" title="Pool source on GitHub" aria-label="Pool source on GitHub" style="text-decoration:none"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg></a> · <a href="https://quaestio.online/terms.html">Terms</a> · <a href="https://quaestio.online/privacy.html">Privacy</a></footer>
   <p class="links" style="font-size:.78rem">By contributing compute you agree to the <a href="https://quaestio.online/terms.html">Terms</a> and <a href="https://quaestio.online/privacy.html">Privacy Policy</a> — as-is, no warranties, use at your own risk.</p>
 </div>
 <script type="module">
@@ -2028,6 +2079,11 @@ async function refreshStats() {
     $("st-served").textContent = s.served ?? 0;
   } catch {}
   try {
+    const act = await (await fetch("/api/pool/active")).json();
+    const an = document.getElementById("st-active");
+    if (an) an.textContent = (act.active || []).length;
+  } catch {}
+  try {
     const sec = localStorage.getItem("quaestio_pool_secret") || "";
     let mine = localStorage.getItem("quaestio_pool_name") || "";
     if (sec && !mine) {
@@ -2051,6 +2107,21 @@ async function refreshStats() {
       return `<div class="leader"${isMine ? ' style="border:1px solid #6366f1;border-radius:8px;padding-left:8px"' : ""}><span>${medals[i] || "▸"} ${esc(l.name)}${isMine ? " (you)" : ""}</span><span class="served">${Number(l.served) || 0} served · ${Number(l.share) || 0}%</span></div>`;
     }).join("");
   } catch {}
+  try {
+    const a = await (await fetch("/api/pool/active")).json();
+    const abox = document.getElementById("active-nodes");
+    if (abox) {
+      if (!a.active || !a.active.length) {
+        abox.innerHTML = '<p style="color:var(--muted)">⚪ No pool nodes active right now — serving from the host box. Keep this tab open to be the first! 🟢</p>';
+      } else {
+        const esc2 = (t) => String(t ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+        const mine2 = localStorage.getItem("quaestio_pool_name") || "";
+        abox.innerHTML = a.active.map((n) =>
+          `<div class="leader"><span>🟢 ${esc2(n.name)}${n.listening ? " 📡" : ""}${mine2 && n.name === mine2 ? " (you)" : ""}</span><span class="served">${Number(n.served) || 0} served</span></div>`
+        ).join("");
+      }
+    }
+  } catch {}
 }
 setInterval(refreshStats, 15000);
 // Auto-start on page load (opt-in): needs WebGPU + a previous registration.
@@ -2059,10 +2130,15 @@ if (localStorage.getItem("quaestio_pool_auto") === "1" && navigator.gpu) {
 }
 </script>
 <script>
+// Legacy one-shot stats (module refreshStats above is the live one).
 fetch("/api/pool/public").then(r=>r.json()).then(s=>{
   document.getElementById("st-nodes").textContent = s.nodes ?? 0;
   document.getElementById("st-share").textContent = (s.total_share ?? 0) + "%";
   document.getElementById("st-served").textContent = s.served ?? 0;
+}).catch(()=>{});
+fetch("/api/pool/active").then(r=>r.json()).then(a=>{
+  const el = document.getElementById("st-active");
+  if (el) el.textContent = (a.active || []).length;
 }).catch(()=>{});
 fetch("/api/pool/leaderboard").then(r=>r.json()).then(d=>{
   const box = document.getElementById("leaders");
