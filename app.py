@@ -32,6 +32,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/bot")
@@ -65,6 +66,16 @@ HOST_ADMIN_IDS = {i.strip() for i in os.environ.get("HOST_ADMIN_IDS", "").split(
 
 app = FastAPI(title="Quaestio admin")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+# Public read-only endpoints (site stats, pool totals/leaderboard) are meant
+# to be fetched cross-origin from quaestio.online — allowlisted, GET only.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://quaestio.online", "https://admin.quaestio.online",
+                   "https://pool.quaestio.online"],
+    allow_methods=["GET"],
+    allow_headers=["Content-Type"],
+    max_age=86400,
+)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE, "static")), name="static")
 
 
