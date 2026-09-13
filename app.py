@@ -1702,6 +1702,16 @@ async def api_host_stats(request: Request):
 # Pages
 # ---------------------------------------------------------------------------
 
+@app.get("/api/site/stats")
+async def api_site_stats():
+    """Public homepage counters: live server count + totals. No auth."""
+    try:
+        servers = len(await bot_guild_ids())
+    except Exception:
+        servers = 0
+    return {"servers": servers, "commands": 41, "paywalls": 0, "private": 100}
+
+
 @app.get("/api/pool/public")
 async def api_pool_public():
     """Public pool totals for the contributor landing page. No auth, no
