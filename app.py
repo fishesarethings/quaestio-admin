@@ -1813,7 +1813,8 @@ a{color:inherit}
   </div>
   <div class="card"><h3>③ Perks</h3><ul><li>Priority routing — your box serves you first</li><li>2–4x request limits by share (more compute = more headroom)</li><li>🌟 contributor badge in <code>/ai status</code> + leaderboard glory below</li><li>Not mining: no crypto, no cash, no payouts — just a faster bot for everyone</li></ul></div>
   <div class="card"><h3>🏆 Top contributors</h3><p style="color:var(--muted)">Anonymous node IDs only — ranked by requests served.</p><div id="leaders"><p style="color:var(--muted)">Loading…</p></div></div>
-  <p class="links">Run a Discord server? <a href="https://admin.quaestio.online">Open the admin panel</a> · <a href="https://quaestio.online">quaestio.online</a> · <a href="https://github.com/fishesarethings/quaestio-admin">pool source</a></p>
+  <p class="links">Run a Discord server? <a href="https://admin.quaestio.online">Open the admin panel</a> · <a href="https://quaestio.online">quaestio.online</a></p>
+  <footer style="margin-top:18px;text-align:center;color:var(--muted);font-size:.82rem"><a href="https://github.com/fishesarethings/quaestio-admin" target="_blank" rel="noopener">ⓖ Pool source on GitHub</a> · <a href="https://quaestio.online/terms.html">Terms</a> · <a href="https://quaestio.online/privacy.html">Privacy</a></footer>
   <p class="links" style="font-size:.78rem">By contributing compute you agree to the <a href="https://quaestio.online/terms.html">Terms</a> and <a href="https://quaestio.online/privacy.html">Privacy Policy</a> — as-is, no warranties, use at your own risk.</p>
 </div>
 <script type="module">
