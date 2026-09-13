@@ -140,6 +140,9 @@ def db_init():
             guild_id TEXT, bucket TEXT, calls INTEGER DEFAULT 0,
             PRIMARY KEY (guild_id, bucket)
         );
+        CREATE TABLE IF NOT EXISTS cmdlog (
+            name TEXT PRIMARY KEY, calls INTEGER DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS memory (
             guild_id TEXT, channel_id TEXT, role TEXT, text TEXT, at TEXT,
             user_id TEXT DEFAULT '', name TEXT DEFAULT ''
@@ -1704,12 +1707,27 @@ async def api_host_stats(request: Request):
 
 @app.get("/api/site/stats")
 async def api_site_stats():
-    """Public homepage counters: live server count + totals. No auth."""
+    """Public homepage counters: live servers, messages, commands. No auth."""
     try:
         servers = len(await bot_guild_ids())
     except Exception:
         servers = 0
-    return {"servers": servers, "commands": 41, "paywalls": 0, "private": 100}
+    try:
+        conn = db()
+        msgs = conn.execute("SELECT COALESCE(SUM(messages),0) FROM xp").fetchone()[0] or 0
+        cmds = conn.execute("SELECT COALESCE(SUM(calls),0) FROM cmdlog").fetchone()[0] or 0
+        conn.close()
+    except Exception:
+        msgs, cmds = 0, 0
+    try:
+        conn = db()
+        nodes = conn.execute("SELECT COUNT(*) FROM hosters WHERE enabled=1").fetchone()[0] or 0
+        conn.close()
+    except Exception:
+        nodes = 0
+    return {"servers": servers, "messages": int(msgs), "cmds": int(cmds),
+            "nodes": int(nodes),
+            "commands": 41, "paywalls": 0, "private": 100}
 
 
 @app.get("/api/pool/public")
