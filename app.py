@@ -339,13 +339,18 @@ async def exchange_code(code: str) -> dict:
         if r.status_code != 200:
             raise HTTPException(400, "OAuth exchange failed")
         data = r.json()
+        token = data.get("access_token") or ""
+        if not token:
+            raise HTTPException(400, "OAuth exchange failed")
         me = await client.get(
             f"{API}/users/@me",
-            headers={"Authorization": f"Bearer {data['access_token']}"},
+            headers={"Authorization": f"Bearer {token}"},
         )
+        if me.status_code != 200:
+            raise HTTPException(400, "OAuth exchange failed")
         guilds = await client.get(
             f"{API}/users/@me/guilds",
-            headers={"Authorization": f"Bearer {data['access_token']}"},
+            headers={"Authorization": f"Bearer {token}"},
         )
     return {
         "user": me.json(),
@@ -353,7 +358,16 @@ async def exchange_code(code: str) -> dict:
     }
 
 
+_sweep_tick = 0
+
 def session_user(request: Request) -> dict:
+    global _sweep_tick
+    _sweep_tick += 1
+    if _sweep_tick % 100 == 0:
+        try:
+            _session_sweep()
+        except Exception:
+            pass
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         entry = SESSIONS.get(auth[7:].strip())
@@ -593,8 +607,9 @@ async def guild_refs(guild_id: str) -> dict:
     REF_CACHE[guild_id] = out
     REF_CACHE_AT[guild_id] = now
     while len(REF_CACHE) > 500:
-        REF_CACHE.pop(next(iter(REF_CACHE)))
-        REF_CACHE_AT.pop(next(iter(REF_CACHE_AT)), None)
+        oldest = next(iter(REF_CACHE))
+        REF_CACHE.pop(oldest, None)
+        REF_CACHE_AT.pop(oldest, None)
     # Bound the caches so a flood of guild IDs can't grow them forever.
     if len(REF_CACHE) > 500:
         oldest = sorted(REF_CACHE_AT, key=lambda k: REF_CACHE_AT[k])[:100]
@@ -719,6 +734,10 @@ _INT_RANGES = {
     "xp_max_words": (1, 500), "xp_cooldown": (0, 3600),
 }
 _FLOAT_RANGES = {"ai_temperature": (0.0, 2.0)}
+_FLAG_KEYS = {"ai_enabled", "ai_mention", "ai_conv", "ai_contribute", "ai_dm",
+              "welcome_enabled", "level_announce", "xp_enabled", "xp_spam",
+              "birthday_enabled"}
+_SOURCE_KEYS = {"ai_source": ("shared", "self"), "host_mode": ("managed", "decentral")}
 _TEXT_MAX = {
     "ai_instructions": 2000, "welcome_message": 2000, "ai_endpoint": 200,
     "ai_model": 80, "ai_personality": 80, "ai_character": 80,
@@ -729,6 +748,16 @@ _TEXT_MAX = {
 
 
 def _validate_setting(key, value):
+    if key in _FLAG_KEYS:
+        v = str(value).strip().lower()
+        if v not in ("0", "1", "true", "false"):
+            raise HTTPException(400, f"{key} must be 0/1")
+        return "1" if v in ("1", "true") else "0"
+    if key in _SOURCE_KEYS:
+        v = str(value).strip().lower()
+        if v not in _SOURCE_KEYS[key]:
+            raise HTTPException(400, f"{key} must be one of {', '.join(_SOURCE_KEYS[key])}")
+        return v
     if key in _INT_RANGES:
         lo, hi = _INT_RANGES[key]
         try:
@@ -1630,11 +1659,14 @@ async def api_delete_preset(request: Request, guild_id: int, kind: str):
     require_admin_guild(request, guild_id)
     if kind not in ("personality", "character"):
         raise HTTPException(400, "kind must be personality or character")
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-    name = str(body.get("name", "")).strip()
+    # Name via query (DELETE bodies get stripped by proxies) or legacy body.
+    name = (request.query_params.get("name") or "").strip()
+    if not name:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON")
+        name = str(body.get("name", "")).strip()
     if not name or name in PRESET_BUILTINS[kind]:
         raise HTTPException(400, "Built-in presets can't be deleted")
     conn = db()
@@ -1718,26 +1750,27 @@ async def api_host_stats(request: Request):
 # Pages
 # ---------------------------------------------------------------------------
 
+_last_servers = 2
+
+
 @app.get("/api/site/stats")
 async def api_site_stats():
     """Public homepage counters: live servers, messages, commands. No auth."""
+    global _last_servers
     try:
         servers = len(await bot_guild_ids())
+        _last_servers = servers
     except Exception:
-        servers = 0
+        servers = _last_servers
+    conn = db()
     try:
-        conn = db()
         msgs = conn.execute("SELECT COALESCE(SUM(messages),0) FROM xp").fetchone()[0] or 0
         cmds = conn.execute("SELECT COALESCE(SUM(calls),0) FROM cmdlog").fetchone()[0] or 0
-        conn.close()
-    except Exception:
-        msgs, cmds = 0, 0
-    try:
-        conn = db()
         nodes = conn.execute("SELECT COUNT(*) FROM hosters WHERE enabled=1").fetchone()[0] or 0
-        conn.close()
     except Exception:
-        nodes = 0
+        msgs, cmds, nodes = 0, 0, 0
+    finally:
+        conn.close()
     return {"servers": servers, "messages": int(msgs), "cmds": int(cmds),
             "nodes": int(nodes),
             "commands": 41, "paywalls": 0, "private": 100}

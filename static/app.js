@@ -582,6 +582,7 @@ async function populateModels(sel, guildId, field, selected) {
     if (selected && !models.includes(selected)) el.innerHTML += `<option value="${ESCAPED(selected)}" selected>${ESCAPED(selected)}</option>`;
   } catch {
     modelState = { online: false, models: [] };
+    if (status) status.textContent = "Host unreachable — keeping your saved model.";
     el.innerHTML = `<option value="${ESCAPED(selected || "")}" ${selected ? "selected" : ""}>${ESCAPED(selected || "(unreachable — save endpoint first)")}</option>`;
   }
 }
@@ -858,14 +859,20 @@ async function saving(btn, fn) {
 function readSettings() {
   const endpointLocked = $("#ai_endpoint").disabled;
   const b = (el) => ($(el).checked ? "1" : "0");
+  const num = (el) => { const v = $(el).value.trim(); return v === "" ? undefined : v; };
+  const ai_memory = num("#ai_memory"), ai_quota = num("#ai_quota"), ai_window = num("#ai_window"),
+    ai_conv_minutes = num("#ai_conv_minutes"), ai_temperature = num("#ai_temperature"),
+    ai_max_tokens = num("#ai_max_tokens"), xp_min_words = num("#xp_min_words"),
+    xp_max_words = num("#xp_max_words"), xp_cooldown = num("#xp_cooldown"),
+    warnlimit = num("#warnlimit");
   return {
     ai_enabled: b("#ai_enabled"),
     ai_source: $("#ai_source").value,
     ...(endpointLocked ? {} : {ai_endpoint: $("#ai_endpoint").value.trim()}),
     ai_model: $("#ai_model").value,
-    ai_memory: $("#ai_memory").value,
-    ai_quota: $("#ai_quota").value,
-    ai_window: $("#ai_window").value,
+    ...(ai_memory === undefined ? {} : {ai_memory: ai_memory}),
+    ...(ai_quota === undefined ? {} : {ai_quota: ai_quota}),
+    ...(ai_window === undefined ? {} : {ai_window: ai_window}),
     ai_personality: $("#ai_personality").value,
     ai_character: $("#ai_character").value,
     ai_contribute: b("#ai_contribute"),
@@ -873,9 +880,9 @@ function readSettings() {
     ai_channels: readAiChannels(),
     ai_mention: b("#ai_mention"),
     ai_conv: b("#ai_conv"),
-    ai_conv_minutes: $("#ai_conv_minutes").value,
-    ai_temperature: $("#ai_temperature").value,
-    ai_max_tokens: $("#ai_max_tokens").value,
+    ...(ai_conv_minutes === undefined ? {} : {ai_conv_minutes: ai_conv_minutes}),
+    ...(ai_temperature === undefined ? {} : {ai_temperature: ai_temperature}),
+    ...(ai_max_tokens === undefined ? {} : {ai_max_tokens: ai_max_tokens}),
     welcome_enabled: b("#welcome_enabled"),
     welcome_channel: refValue("welcome_channel"),
     welcome_message: $("#welcome_message").value,
@@ -886,10 +893,10 @@ function readSettings() {
     xp_enabled: b("#xp_enabled"),
     level_announce: b("#level_announce"),
     xp_spam: b("#xp_spam"),
-    xp_min_words: $("#xp_min_words").value,
-    xp_max_words: $("#xp_max_words").value,
-    xp_cooldown: $("#xp_cooldown").value,
-    warnlimit: $("#warnlimit").value,
+    ...(xp_min_words === undefined ? {} : {xp_min_words: xp_min_words}),
+    ...(xp_max_words === undefined ? {} : {xp_max_words: xp_max_words}),
+    ...(xp_cooldown === undefined ? {} : {xp_cooldown: xp_cooldown}),
+    ...(warnlimit === undefined ? {} : {warnlimit: warnlimit}),
     birthday_enabled: b("#birthday_enabled"),
     birthday_channel: refValue("birthday_channel"),
   };
@@ -898,12 +905,32 @@ function readSettings() {
 function renderWelcomePreview() {
   const msg = $("#welcome_message").value;
   const preview = $("#welcome-preview");
+  preview.textContent = "";
   if (!msg) { preview.innerHTML = '<span class="muted">No message yet.</span>'; return; }
   const server = activeGuild ? activeGuild.name : "My Server";
-  const rendered = msg
-    .replace(/\{member\}/g, "<b>NewMember</b>")
-    .replace(/\{guild\}/g, `<b>${ESCAPED(server)}</b>`);
-  preview.innerHTML = ESCAPED(rendered).replace(/&lt;b&gt;/g, "<b>").replace(/&lt;\/b&gt;/g, "</b>");
+  const banner = ($("#welcome_banner") || { value: "" }).value.trim();
+  // Token-safe render: text nodes only, bold wrapper for names.
+  const parts = msg.split(/(\{member\}|\{server\}|\{guild\}|\{count\}|\{icon\}|\{avatar\})/g);
+  for (const part of parts) {
+    if (part === "{member}") {
+      const b = document.createElement("b"); b.textContent = "NewMember"; preview.appendChild(b);
+    } else if (part === "{server}" || part === "{guild}") {
+      const b = document.createElement("b"); b.textContent = server; preview.appendChild(b);
+    } else if (part === "{count}") {
+      const b = document.createElement("b"); b.textContent = "1,234"; preview.appendChild(b);
+    } else if (part === "{icon}" || part === "{avatar}") {
+      const em = document.createElement("em"); em.textContent = part; preview.appendChild(em);
+    } else if (part) {
+      preview.appendChild(document.createTextNode(part));
+    }
+  }
+  if (banner && /^https:\/\/[^\s"'<>]+$/i.test(banner)) {
+    const img = document.createElement("img");
+    img.src = banner; img.alt = "Banner preview";
+    img.style.cssText = "display:block;max-width:100%;border-radius:10px;margin-top:8px";
+    img.onerror = () => img.remove();
+    preview.appendChild(img);
+  }
 }
 
 /* ---------- host view ---------- */
@@ -1096,6 +1123,7 @@ function wireEvents() {
       });
       if (!q) {
         $$(".filtered-out").forEach((el) => el.classList.remove("filtered-out"));
+        $$(".tab.hidden").forEach((t) => t.classList.remove("hidden"));
       } else {
         $$(".tab").forEach((t) => {
           const panel = $("#panel-" + t.dataset.tab);
@@ -1167,6 +1195,7 @@ function wireEvents() {
 
   sv.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" && e.key !== " ") return;
+    if (e.target.closest("button")) return;
     const tile = e.target.closest(".preset-tile");
     if (tile) {
       e.preventDefault();
@@ -1235,8 +1264,8 @@ function wireEvents() {
       if (!confirm(`Delete custom ${kind} "${name}"?`)) return;
       await saving(delBtn, async () => {
         try {
-          await api(`/api/guilds/${activeGuild.id}/presets/${kind}`, {
-            method: "DELETE", body: JSON.stringify({ name }),
+          await api(`/api/guilds/${activeGuild.id}/presets/${kind}?name=${encodeURIComponent(name)}`, {
+            method: "DELETE",
           });
           await refreshPresets();
         } catch { /* toast already shown */ }
@@ -1301,16 +1330,19 @@ function wireEvents() {
     await saving($("#save-host"), async () => {
       try {
         const mode = ($("#host-mode-seg .seg-btn.active") || {}).dataset?.mode || "managed";
+        const hb = {};
+        hb.host_mode = mode;
+        const hep = $("#host_endpoint").value.trim();
+        if (hep) hb.ai_endpoint = hep;
+        if ($("#host_model").value) hb.ai_model = $("#host_model").value;
+        const hm = $("#host_memory").value.trim();
+        if (hm) hb.ai_memory = hm;
+        const hq = $("#host_quota").value.trim();
+        if (hq) hb.ai_quota = hq;
+        hb.ai_dm = $("#host_ai_dm").checked ? "1" : "0";
         await api("/api/host/settings", {
           method: "POST",
-          body: JSON.stringify({
-            host_mode: mode,
-            ai_endpoint: $("#host_endpoint").value.trim(),
-            ai_model: $("#host_model").value,
-            ai_memory: $("#host_memory").value,
-            ai_quota: $("#host_quota").value,
-            ai_dm: $("#host_ai_dm").checked ? "1" : "0",
-          }),
+          body: JSON.stringify(hb),
         });
         toast("Host settings saved");
         const el = $("#save-status-host");
