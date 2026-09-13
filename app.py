@@ -225,6 +225,13 @@ def _migrate_pool_broker(conn):
             done_at TEXT DEFAULT '', claimed_by INTEGER DEFAULT 0, tries INTEGER DEFAULT 0
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ops_inbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT, subject TEXT, body TEXT,
+            created_at TEXT DEFAULT '', answered INTEGER DEFAULT 0
+        )"""
+    )
     for ddl in (
         "CREATE INDEX IF NOT EXISTS idx_jobs_status ON pool_jobs(status, model, id)",
         "CREATE INDEX IF NOT EXISTS idx_hosters_pull ON hosters(pull, enabled)",
@@ -1240,6 +1247,34 @@ async def api_pool_me(request: Request):
     }
 
 
+OPS_INBOX_SECRET = os.environ.get("OPS_INBOX_SECRET", "").strip()
+
+
+@app.post("/api/ops/inbox")
+async def api_ops_inbox(request: Request):
+    """Email Worker webhook: store an inbound reply for the monitor loop.
+    Shared-secret auth; tiny bodies only; table capped at 50 rows."""
+    if not OPS_INBOX_SECRET or not _safe_eq(request.headers.get("x-ops-secret", ""), OPS_INBOX_SECRET):
+        raise HTTPException(401, "bad inbox secret")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    sender = str(body.get("from") or "")[:200]
+    subject = str(body.get("subject") or "")[:200]
+    text = str(body.get("text") or body.get("body") or "")[:2000]
+    if not (sender or text):
+        raise HTTPException(400, "empty message")
+    conn = db()
+    conn.execute("INSERT INTO ops_inbox (sender, subject, body, created_at) VALUES (?, ?, ?, ?)",
+                 (sender, subject, text,
+                  datetime.datetime.now(datetime.timezone.utc).isoformat()))
+    conn.execute("DELETE FROM ops_inbox WHERE id NOT IN (SELECT id FROM ops_inbox ORDER BY id DESC LIMIT 50)")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
 @app.post("/api/pool/report")
 async def api_pool_report(request: Request):
     """Bot health report for a node (mirrors the local pool_record logic)."""
@@ -1739,6 +1774,7 @@ a{color:inherit}
 <body>
 <div class="wrap">
   <a class="brand" href="https://quaestio.online"><img src="https://quaestio.online/assets/logo-512.png" alt="Quaestio"><strong>Quaestio</strong>&nbsp;pool</a>
+  <span style="float:right"><a href="https://github.com/fishesarethings/quaestio-admin" target="_blank" rel="noopener" title="Pool source on GitHub" aria-label="Pool source on GitHub" style="color:var(--muted);opacity:.7"><svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg></a></span>
   <h1>Lend spare AI compute.<br><span class="grad">Earn real perks.</span></h1>
   <p class="lead">Your box answers AI requests for Quaestio servers whenever it's online — and goes quiet on its own when it's not. Anonymous by design: random node IDs only, endpoints encrypted.</p>
   <div class="stats">
@@ -1777,7 +1813,8 @@ a{color:inherit}
   </div>
   <div class="card"><h3>③ Perks</h3><ul><li>Priority routing — your box serves you first</li><li>2–4x request limits by share (more compute = more headroom)</li><li>🌟 contributor badge in <code>/ai status</code> + leaderboard glory below</li><li>Not mining: no crypto, no cash, no payouts — just a faster bot for everyone</li></ul></div>
   <div class="card"><h3>🏆 Top contributors</h3><p style="color:var(--muted)">Anonymous node IDs only — ranked by requests served.</p><div id="leaders"><p style="color:var(--muted)">Loading…</p></div></div>
-  <p class="links">Run a Discord server? <a href="https://admin.quaestio.online">Open the admin panel</a> · <a href="https://quaestio.online">quaestio.online</a></p>
+  <p class="links">Run a Discord server? <a href="https://admin.quaestio.online">Open the admin panel</a> · <a href="https://quaestio.online">quaestio.online</a> · <a href="https://github.com/fishesarethings/quaestio-admin">pool source</a></p>
+  <p class="links" style="font-size:.78rem">By contributing compute you agree to the <a href="https://quaestio.online/terms.html">Terms</a> and <a href="https://quaestio.online/privacy.html">Privacy Policy</a> — as-is, no warranties, use at your own risk.</p>
 </div>
 <script type="module">
 import { CreateMLCEngine } from "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.79/+esm";

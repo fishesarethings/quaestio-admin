@@ -1322,6 +1322,19 @@ function wireEvents() {
 async function init() {
   initEmojiPickers();
   wireEvents();
+  try {
+    if (localStorage.getItem("q_consent") !== "1") {
+      const bar = $("#consent");
+      const btn = $("#consent-ok");
+      if (bar) {
+        bar.classList.remove("hidden");
+        if (btn) btn.addEventListener("click", () => {
+          bar.classList.add("hidden");
+          try { localStorage.setItem("q_consent", "1"); } catch {}
+        });
+      }
+    }
+  } catch {}
   grabTokenFromHash();
   try {
     me = await api("/api/me");
